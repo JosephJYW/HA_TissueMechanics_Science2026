@@ -1,0 +1,302 @@
+
+## Load libraries
+```{r}
+library(Seurat)
+library(readr)
+library(DoubletFinder)
+library(future)
+library(reticulate)
+library(SeuratWrappers)
+library(ggplot2)
+library(presto)
+library(dplyr)
+library(writexl)
+library(ggrepel)
+library(Matrix)
+library(tools)
+library(biomaRt)
+library(readxl)
+library(lncGSEA)
+library(GSEABase)
+library(viridis)
+library(ggh4x)
+```
+
+## MI et al pre-procesing
+```{r}
+parent_dir <- "/scratch/users/bmui20/Project_Fracture/Femoral Fracture Healing"
+folders <- list.dirs(parent_dir, recursive = FALSE, full.names = TRUE)
+folders <- folders[grep("SC", folders)]
+seurat_list <- list()
+
+for (folder in folders) {
+  # Load matrix using Read10X
+  counts <- Read10X(data.dir = folder)
+  # Create Seurat object, use folder name as object/list key
+  sample_name <- basename(folder)
+  seurat_obj <- CreateSeuratObject(counts, project = sample_name)
+  seurat_list[[sample_name]] <- seurat_obj
+}
+
+for (obj_name in names(seurat_list)) {
+  # Assign condition based on object name
+  condition_value <- if (grepl("DPF", obj_name)) {
+    "Fracture"
+  } else if (grepl("Uninjured", obj_name)) {
+    "Uninjured"
+  } else {
+    NA  # Could be blank, NA, or another default
+  }
+  # Add/overwrite 'Condition' column in metadata
+  seurat_list[[obj_name]]$Condition <- condition_value
+}
+```
+
+## Run DoubletFinder
+```{r}
+set.seed(1234)
+filtered_combined <- list()
+options(future.globals.maxSize = 8 * 1024^3)  # 8 GB limit
+plan(multisession, workers = 4)
+
+for (name in names(seurat_list)) {
+  seu <- seurat_list[[name]]
+  
+  # Example quality filter
+  seu <- subset(seu, subset = nFeature_RNA > 200)
+  seu <- NormalizeData(seu)
+  seu <- FindVariableFeatures(seu)
+  seu <- ScaleData(seu)
+  seu <- RunPCA(seu)
+  seu <- FindNeighbors(seu)
+  seu <- FindClusters(seu)
+  
+  # DoubletFinder steps
+  sweep.list <- paramSweep(seu, PCs = 1:20, sct = FALSE)
+  sweep.stats <- summarizeSweep(sweep.list, GT = FALSE)
+  bcmvn <- find.pK(sweep.stats)
+  optimal_pK <- as.numeric(as.character(bcmvn$pK[which.max(bcmvn$BCmetric)]))
+  nExp_poi <- round(0.008 * nrow(seu@meta.data))
+  homotypic.prop <- modelHomotypic(seu$seurat_clusters)
+  nExp_poi.adj <- round(nExp_poi * (1 - homotypic.prop))
+  seu <- doubletFinder(seu, PCs=1:20, pN=0.25, pK=optimal_pK, nExp=nExp_poi.adj)
+  
+  df.class.col <- grep("DF.classifications", colnames(seu@meta.data), value = TRUE)[1]
+  singlet_cells <- rownames(seu@meta.data)[seu@meta.data[[df.class.col]] == "Singlet"]
+  seu <- subset(seu, cells = singlet_cells)
+  
+  filtered_combined[[name]] <- seu
+}
+```
+
+## Filter out cells with high mitochondrial genes and low features
+```{r}
+for (objname in names(filtered_combined)) {
+  # Calculate percent mitochondrial
+  filtered_combined[[objname]][["percent.mt"]] <- PercentageFeatureSet(
+    filtered_combined[[objname]], pattern = "^mt-"
+  )
+  
+  # Subset cells with mitochondrial percentage < 10%
+  filtered_combined[[objname]] <- subset(
+    filtered_combined[[objname]],
+    subset = percent.mt < 10 & nFeature_RNA > 200
+  )
+}
+saveRDS(filtered_combined, file = "filtered_mito_nfeatures_doublet.rds")
+```
+
+## Merge objects
+```{r}
+sample_names <- names(filtered_combined)
+merged_obj <- merge(x = filtered_combined[[1]], y = filtered_combined[-1], add.cell.ids = sample_names)
+prefix <- sub("_[^_]+$", "", rownames(merged_obj@meta.data))
+merged_obj$whichdataset <- prefix
+
+merged_obj <- NormalizeData(merged_obj)
+merged_obj <- FindVariableFeatures(merged_obj)
+merged_obj <- ScaleData(merged_obj)
+merged_obj <- RunPCA(merged_obj)
+merged_obj <- FindNeighbors(merged_obj, dims = 1:30, reduction = "pca")
+set.seed(1234)
+merged_obj <- FindClusters(merged_obj, resolution = 0.1)
+merged_obj <- RunUMAP(merged_obj, dims = 1:30, reduction = "pca", reduction.name = "umap.unintegrated")
+DimPlot(merged_obj, group.by = "whichdataset")
+# DimPlot(merged_obj, reduction = "umap.unintegrated", split.by = "whichdataset", ncol = 6)
+# ggsave("umap_matrix_unintegrated.pdf", plot = p, width = 24, height = 48)
+
+filename <- "fracture_merged_pre-integrated.rds"
+saveRDS(merged_obj, "fracture_merged_pre-integrated.rds")
+merged_obj <- readRDS("fracture_merged_pre-integrated.rds")
+```
+
+# Integrate (performed as job on HPC)
+```{r, eval=FALSE}
+# ---- Library Setup ----
+.libPaths('/scratch/users/bmui20/Project_005/R/x86_64-pc-linux-gnu-library/4.4')
+Sys.setenv(RETICULATE_PYTHON = "/scratch/users/bmui20/Project_005/miniconda3/envs/scvi-env/bin/python")
+library(Seurat)
+library(SeuratWrappers)
+library(DoubletFinder)
+library(readxl)
+library(reticulate)
+library(hdf5r)
+
+DATA_PATH <- "/scratch/users/bmui20/Project_Fracture"
+RDS_PATH <- file.path(DATA_PATH, "SeuratRDS")
+dir.create(RDS_PATH, showWarnings = FALSE)
+
+# ---- Step 5: Integrate using scVI (In-place) ----
+merged_obj <- readRDS(file.path(DATA_PATH, "fracture_merged_pre-integrated.rds"))
+use_condaenv("/scratch/users/bmui20/Project_005/miniconda3/envs/scvi-env", required=TRUE)
+py_config()
+
+merged_obj <- IntegrateLayers(
+  object = merged_obj, method = scVIIntegration,
+  new.reduction = "integrated.scvi",
+  conda_env = "/scratch/users/bmui20/Project_005/miniconda3/envs/scvi-env", verbose = FALSE
+)
+
+# ---- Step 6: Post-integration Clustering ----
+merged_obj <- FindNeighbors(merged_obj, reduction = "integrated.scvi", dims = 1:30)
+set.seed(1234)
+merged_obj <- FindClusters(merged_obj, resolution = 0.1)
+merged_obj <- RunUMAP(merged_obj, reduction = "integrated.scvi", dims = 1:30, reduction.name = "umap.scvi")
+
+DimPlot(merged_obj, reduction = "umap.scvi", group.by = "Condition")
+
+# ---- Step 7: Final Save ----
+filename <- "fracture_integrated.rds"
+saveRDS(merged_obj, file = file.path(DATA_PATH, filename))
+rm(merged_obj)
+gc()
+```
+
+## Join layers
+```{r}
+merged_obj <- readRDS("fracture_integrated.rds")
+# DimPlot(merged_obj, reduction = "umap.scvi")
+# DimPlot(merged_obj, reduction = "umap.scvi", split.by = "whichdataset", ncol = 6)
+# ggsave("umap_matrix_integrated.pdf", plot = p, width = 24, height = 48)
+merged_obj[["RNA"]] <- JoinLayers(merged_obj[["RNA"]])
+# saveRDS(merged_obj, "fracture_joinlayers.rds")
+# merged_obj <- readRDS("fracture_joinlayers.rds")
+
+DefaultAssay(merged_obj) <- "RNA"
+DimPlot(merged_obj,
+    reduction = "umap.scvi",
+    cells.highlight = WhichCells(merged_obj, idents = "8"),
+    sizes.highlight = 2 # Increase point size for emphasis
+)
+```
+
+## Cluster annotation
+```{r}
+DefaultAssay(merged_obj) = "RNA"
+markers <- FindAllMarkers(merged_obj,
+                          only.pos = TRUE,
+                          min.pct = 0.25,
+                          logfc.threshold = 0.25,
+                          max.cells.per.ident = 1000,
+                          test.use = "wilcox")
+markers.df <- as.data.frame(markers)
+
+markers2 <- markers %>%
+  group_by(cluster) %>%
+  dplyr::filter(avg_log2FC > 1) %>%
+  slice_max(order_by = avg_log2FC, n = 20)
+markers2.df <- as.data.frame(markers2)
+
+write_xlsx(markers2.df, "top20markers.xlsx")
+write_xlsx(markers.df, "allmarkers.xlsx")
+
+clusters <- as.character(merged_obj$seurat_clusters)
+cluster_to_type <- c(
+  "0" = "Fibroblast",
+  "1" = "Immune Cell",
+  "2" = "Neuronal",
+  "3" = "Skeletal Muscle Cell",
+  "4" = "Immune Cell",
+  "5" = "Endothelial Cell",
+  "6" = "Immune Cell",
+  "7" = "Perivascular Cell",
+  "8" = "Neuronal",
+  "9" = "Neuronal",
+  "10" = "Adipocyte",
+  "11" = "NA",
+  "12" = "NA")
+  
+celltype.annotation <- ifelse(clusters %in% names(cluster_to_type), cluster_to_type[clusters], "Other")
+merged_obj$celltype <- celltype.annotation
+saveRDS(merged_obj, "fracture_joinlayers2.rds")
+#merged_obj <- readRDS("fracture_joinlayers2.rds")
+```
+
+## Create global UMAPs by celltype and condition
+```{r}
+p1 = DimPlot(merged_obj, cols = c("#1f77b4",
+                                                         "#ff7f0e",
+                                                         "#279e68",
+                                                         "#d62728",
+                                                         "#aa40fc",
+                                                         "#8d564b"), pt.size = 0.1) + theme(aspect.ratio = 1)
+ggsave("fracture_celltype.pdf", p1, width = 5, height = 3, units = "in", scale = 1.5)
+
+p2 = DimPlot(merged_obj, group.by = "Condition", cols = c("#1f77b4", "#ff7f0e"), pt.size = 0.1) + theme(aspect.ratio = 1)
+ggsave("fracture_condition.pdf", p2, width = 5, height = 3, units = "in", scale = 1.5)
+
+p3 = DimPlot(merged_obj, group.by = "whichdataset", cols = c("#1f77b4",
+                                                         "#ff7f0e",
+                                                         "#279e68",
+                                                         "#d62728",
+                                                         "#aa40fc",
+                                                         "#8d564b"), pt.size = 0.1) + theme(aspect.ratio = 1)
+ggsave("fracture_whichdataset.pdf", p3, width = 5, height = 3, units = "in", scale = 1.5)
+```
+
+## Fibroblast subsetting
+```{r}
+fibro_obj <- subset(
+  x = merged_obj,
+  subset = celltype == "Fibroblast")
+DefaultAssay(fibro_obj) <- "RNA"
+
+Reductions(fibro_obj)
+
+fibro_obj <- FindNeighbors(fibro_obj, reduction = "integrated.scvi", dims = 1:30)
+fibro_obj <- FindClusters(fibro_obj, resolution = 0.5)
+fibro_obj <- RunUMAP(fibro_obj, reduction = "integrated.scvi", dims = 1:30)
+DimPlot(fibro_obj, group.by ="Condition", split.by = "Condition")
+VlnPlot(fibro_obj, features = c("Col1a1"), group.by = "Condition")
+```
+
+## Create dotplot of HA-relevant genes
+```{r}
+fibro_obj$DPF <- sub(".*_", "", fibro_obj$whichdataset)
+fibro_obj$DPF <- factor(fibro_obj$DPF, levels = c(
+  "7DPF", "5DPF", 
+  "3DPF", "Uninjured"))
+Idents(fibro_obj) <- "DPF"
+genes.to.plot <- c("Hapln1",
+                   "Hapln2", 
+                   "Hapln3",
+                   "Hapln4",
+                   "Cd44",
+                   "Has1",
+                   "Has2",
+                   "Has3",
+                   "Vcan",
+                   "Bcan",
+                   "Ncan",
+                   "Tnfaip6",
+                   "Hmmr")
+p1 = DotPlot(fibro_obj, features = genes.to.plot, group.by = "DPF", dot.scale = 5) +
+  geom_point(aes(size = pct.exp), shape = 21, colour = "black", stroke = 0.5) +
+  scale_color_viridis(option = "plasma", direction = -1) +
+  guides(size = guide_legend(override.aes = list(shape = 21, colour = "black", fill = "white"))) +
+  theme(panel.background = element_rect(color = "black", fill = NA, size = 1),
+        axis.text.x = element_text(angle = 90)) + 
+force_panelsizes(rows = unit(0.8, "in"),
+                   cols = unit(1.8, "in"))
+ggsave("fracture_dotplot.pdf", p1, width = 5, height = 3, units = "in")
+```
