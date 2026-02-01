@@ -1,0 +1,477 @@
+```{r}
+.libPaths("/scratch/users/bmui20/Project_005/R/x86_64-pc-linux-gnu-library/4.4")
+library(Seurat)
+library(readr)
+library(DoubletFinder)
+library(future)
+library(reticulate)
+library(SeuratWrappers)
+library(ggplot2)
+library(presto)
+library(dplyr)
+library(writexl)
+library(ggrepel)
+library(Matrix)
+library(tools)
+library(biomaRt)
+library(readxl)
+library(lncGSEA)
+library(GSEABase)
+```
+
+## MI et al pre-procesing
+```{r}
+parent_dir <- "/scratch/users/bmui20/Project_MI/Myocardial Infarction"
+folders <- list.dirs(parent_dir, recursive = FALSE, full.names = TRUE)
+folders <- folders[grep("scRNA-seq_", folders)]
+seurat_list <- list()
+
+for (folder in folders) {
+  # Load matrix using Read10X
+  counts <- Read10X(data.dir = folder)
+  # Create Seurat object, use folder name as object/list key
+  sample_name <- basename(folder)
+  seurat_obj <- CreateSeuratObject(counts, project = sample_name)
+  seurat_list[[sample_name]] <- seurat_obj
+}
+
+for (objname in names(seurat_list)) {
+  if (grepl("P1_1MI", objname, ignore.case = TRUE) | grepl("P1_3MI", objname, ignore.case = TRUE)) {
+    seurat_list[[objname]]$Condition <- "Non-regeneration"
+  } else if (grepl("P1_1Sham", objname, ignore.case = TRUE) | grepl("P1_3Sham", objname, ignore.case = TRUE)) {
+    seurat_list[[objname]]$Condition <- "Non-regeneration Sham"
+  } else if (grepl("P8_1MI", objname, ignore.case = TRUE) | grepl("P8_3MI", objname, ignore.case = TRUE)) {
+    seurat_list[[objname]]$Condition <- "Regeneration"
+  } else if (grepl("P8_1Sham", objname, ignore.case = TRUE) | grepl("P8_3Sham", objname, ignore.case = TRUE)) {
+    seurat_list[[objname]]$Condition <- "Regeneration Sham"
+  } else {
+    seurat_list[[objname]]$Condition <- NA
+  }
+}
+```
+
+## Run DoubletFinder
+```{r}
+set.seed(1234)
+filtered_combined <- list()
+options(future.globals.maxSize = 8 * 1024^3)  # 8 GB limit
+plan(multisession, workers = 4)
+
+for (name in names(seurat_list)) {
+  seu <- seurat_list[[name]]
+  
+  # Example quality filter
+  seu <- subset(seu, subset = nFeature_RNA > 200)
+  seu <- NormalizeData(seu)
+  seu <- FindVariableFeatures(seu)
+  seu <- ScaleData(seu)
+  seu <- RunPCA(seu)
+  seu <- FindNeighbors(seu)
+  seu <- FindClusters(seu)
+  
+  # DoubletFinder steps
+  sweep.list <- paramSweep(seu, PCs = 1:20, sct = FALSE)
+  sweep.stats <- summarizeSweep(sweep.list, GT = FALSE)
+  bcmvn <- find.pK(sweep.stats)
+  optimal_pK <- as.numeric(as.character(bcmvn$pK[which.max(bcmvn$BCmetric)]))
+  nExp_poi <- round(0.008 * nrow(seu@meta.data))
+  homotypic.prop <- modelHomotypic(seu$seurat_clusters)
+  nExp_poi.adj <- round(nExp_poi * (1 - homotypic.prop))
+  seu <- doubletFinder(seu, PCs=1:20, pN=0.25, pK=optimal_pK, nExp=nExp_poi.adj)
+  
+  df.class.col <- grep("DF.classifications", colnames(seu@meta.data), value = TRUE)[1]
+  singlet_cells <- rownames(seu@meta.data)[seu@meta.data[[df.class.col]] == "Singlet"]
+  seu <- subset(seu, cells = singlet_cells)
+  
+  filtered_combined[[name]] <- seu
+}
+```
+
+## Filter out cells with high mitochondrial genes and low features
+```{r}
+for (objname in names(filtered_combined)) {
+  # Calculate percent mitochondrial
+  filtered_combined[[objname]][["percent.mt"]] <- PercentageFeatureSet(
+    filtered_combined[[objname]], pattern = "^mt-"
+  )
+  
+  # Subset cells with mitochondrial percentage < 10%
+  filtered_combined[[objname]] <- subset(
+    filtered_combined[[objname]],
+    subset = percent.mt < 10 & nFeature_RNA > 200
+  )
+}
+saveRDS(filtered_combined, file = "filtered_mito_nfeatures_doublet.rds")
+```
+
+## Merge objects
+```{r}
+sample_names <- names(filtered_combined)
+merged_obj <- merge(x = filtered_combined[[1]], y = filtered_combined[-1], add.cell.ids = sample_names)
+prefix <- sub("_[^_]+$", "", rownames(merged_obj@meta.data))
+merged_obj$whichdataset <- prefix
+
+merged_obj <- NormalizeData(merged_obj)
+merged_obj <- FindVariableFeatures(merged_obj)
+merged_obj <- ScaleData(merged_obj)
+merged_obj <- RunPCA(merged_obj)
+merged_obj <- FindNeighbors(merged_obj, dims = 1:30, reduction = "pca")
+set.seed(1234)
+merged_obj <- FindClusters(merged_obj, resolution = 0.1)
+merged_obj <- RunUMAP(merged_obj, dims = 1:30, reduction = "pca", reduction.name = "umap.unintegrated")
+DimPlot(merged_obj, group.by = "whichdataset")
+# DimPlot(merged_obj, reduction = "umap.unintegrated", split.by = "whichdataset", ncol = 6)
+# ggsave("umap_matrix_unintegrated.pdf", plot = p, width = 24, height = 48)
+
+filename <- "MI_merged_pre-integrated.rds"
+saveRDS(merged_obj, "MI_merged_pre-integrated.rds")
+merged_obj <- readRDS("MI_merged_pre-integrated.rds")
+DimPlot(merged_obj, reduction = "umap.scvi")
+```
+
+## Integrate (performed as job)
+```{r, eval=FALSE}
+# ---- Library Setup ----
+.libPaths('/scratch/users/bmui20/Project_005/R/x86_64-pc-linux-gnu-library/4.4')
+Sys.setenv(RETICULATE_PYTHON = "/scratch/users/bmui20/Project_005/miniconda3/envs/scvi-env/bin/python")
+library(Seurat)
+library(SeuratWrappers)
+library(DoubletFinder)
+library(readxl)
+library(reticulate)
+library(hdf5r)
+
+DATA_PATH <- "/scratch/users/bmui20/Project_MI/Myocardial Infarction"
+RDS_PATH <- file.path(DATA_PATH, "SeuratRDS")
+dir.create(RDS_PATH, showWarnings = FALSE)
+
+# ---- Step 5: Integrate using scVI (In-place) ----
+merged_obj <- readRDS(file.path(DATA_PATH, "MI_merged_pre-integrated.rds"))
+use_condaenv("/scratch/users/bmui20/Project_005/miniconda3/envs/scvi-env", required=TRUE)
+py_config()
+
+merged_obj <- IntegrateLayers(
+  object = merged_obj, method = scVIIntegration,
+  new.reduction = "integrated.scvi",
+  conda_env = "/scratch/users/bmui20/Project_005/miniconda3/envs/scvi-env", verbose = FALSE
+)
+
+# ---- Step 6: Post-integration Clustering ----
+merged_obj <- FindNeighbors(merged_obj, reduction = "integrated.scvi", dims = 1:30)
+set.seed(1234)
+merged_obj <- FindClusters(merged_obj, resolution = 0.1)
+merged_obj <- RunUMAP(merged_obj, reduction = "integrated.scvi", dims = 1:30, reduction.name = "umap.scvi")
+
+DimPlot(merged_obj, reduction = "umap.scvi", group.by = "Condition")
+
+# ---- Step 7: Final Save ----
+filename <- "MI_integrated.rds"
+saveRDS(merged_obj, file = file.path(DATA_PATH, filename))
+rm(merged_obj)
+gc()
+```
+
+## Join layers
+```{r}
+merged_obj <- readRDS("MI_integrated.rds")
+
+# DimPlot(merged_obj, reduction = "umap.scvi", split.by = "whichdataset", ncol = 6)
+merged_obj[["RNA"]] <- JoinLayers(merged_obj[["RNA"]])
+saveRDS(merged_obj, "MI_joinlayers.rds")
+merged_obj <- readRDS("MI_joinlayers.rds")
+
+DefaultAssay(merged_obj) <- "RNA"
+DimPlot(merged_obj,
+    reduction = "umap.scvi",
+    cells.highlight = WhichCells(merged_obj, idents = "6"),
+    sizes.highlight = 2 # Increase point size for emphasis
+)
+```
+
+## Cluster annotation
+```{r}
+DefaultAssay(merged_obj) = "RNA"
+markers <- FindAllMarkers(merged_obj,
+                          only.pos = TRUE,
+                          min.pct = 0.25,
+                          logfc.threshold = 0.25,
+                          max.cells.per.ident = 1000,
+                          test.use = "wilcox")
+markers.df <- as.data.frame(markers)
+
+markers2 <- markers %>%
+  group_by(cluster) %>%
+  dplyr::filter(avg_log2FC > 1) %>%
+  slice_max(order_by = avg_log2FC, n = 20)
+markers2.df <- as.data.frame(markers2)
+
+write_xlsx(markers2.df, "top20markers.xlsx")
+write_xlsx(markers.df, "allmarkers.xlsx")
+
+clusters <- as.character(merged_obj$seurat_clusters)
+cluster_to_type <- c(
+  "0" = "Fibroblast",
+  "1" = "Endothelial Cell",
+  "2" = "Perivascular Cell",
+  "3" = "Macrophage",
+  "4" = "Epicardial Cell",
+  "5" = "Neutrophil",
+  "6" = "Endothelial Cell",
+  "7" = "RBCs",
+  "8" = "B Cell",
+  "9" = "T Cell",
+  "10" = "Cardiomyocyte")
+  
+celltype.annotation <- ifelse(clusters %in% names(cluster_to_type), cluster_to_type[clusters], "Other")
+merged_obj$celltype <- celltype.annotation
+saveRDS(merged_obj,"MI_joinlayers2.rds")
+#merged_obj <- readRDS("MI_joinlayers2.rds")
+
+```
+
+## Create global UMAPs by condition and celltype
+```{r}
+DimPlot(merged_obj, reduction = "umap.scvi")
+my_15_cols <- c(
+  "#1f77b4", # blue
+  "#ff7f0e", # orange
+  "#2ca02c", # green
+  "#d62728", # red
+  "#9467bd", # purple
+  "#8c564b", # brown
+  "#e377c2", # pink
+  "#7f7f7f", # gray
+  "#bcbd22", # yellow-green
+  "#17becf", # cyan
+  "#393b79", # dark blue
+  "#637939", # olive
+  "#8c6d31", # dark tan
+  "#843c39", # dark red
+  "#7b4173"  # dark magenta
+)
+
+p1 = DimPlot(
+  merged_obj,
+  reduction = "umap.scvi",
+  group.by = "celltype",   # or "seurat_clusters", etc.
+  cols = my_15_cols
+)
+ggsave("umap_matrix_integrated.pdf", plot = p1, width = 7, height = 7)
+
+p1 = DimPlot(merged_obj, reduction = "umap.scvi", group.by = "Condition")
+ggsave("umap_matrix_conditions.pdf", plot = p1, width = 7, height = 7)
+```
+
+## Set up metadata for DEG analysis
+```{r}
+table(merged_obj$orig.ident)
+# Get current meta.data as a data.frame
+meta <- merged_obj@meta.data
+
+# Convenience vector
+oi <- as.character(meta$orig.ident)
+
+# 2.1 Age: look between first and second underscores
+# "scRNA-seq_P1_1MI" -> "P1"
+age_part <- sub("^scRNA-seq_", "", oi)       # "P1_1MI"
+age      <- sub("_.*$", "", age_part)       # take everything before first "_"
+
+# 2.2 Remaining part after Age: "1MI" or "3Sham"
+rest     <- sub("^[^_]+_", "", age_part)    # drop "P1_": "1MI" or "3Sham"
+
+# 2.3 Day: first character of rest (assuming 1 or 3 only)
+day      <- substr(rest, 1, 1)
+
+# 2.4 Injury: remaining part after the first character
+injury   <- substr(rest, 2, nchar(rest))    # "MI" or "Sham"
+
+# 2.5 Construct a sample_id (e.g. "P1_1_MI")
+sample_id <- paste(age, day, injury, sep = "-")
+
+# 2.6 Attach to Seurat object
+merged_obj$Age       <- factor(age, levels = c("P1", "P8"))
+merged_obj$Day       <- factor(day, levels = c("1", "3"))
+merged_obj$Injury    <- factor(injury, levels = c("Sham", "MI"))
+merged_obj$sample_id <- sample_id
+```
+
+## Pseudobulk, D-of-D analysis
+```{r}
+library(Seurat)
+library(edgeR)
+
+Idents(merged_obj) <- "celltype"
+fibro <- subset(merged_obj, idents = "Fibroblast")
+
+fibro$sample_id <- fibro@meta.data$sample_id
+
+pb_counts <- AggregateExpression(
+  fibro,
+  assays = "RNA",
+  slot   = "counts",
+  group.by = "sample_id",
+  return.seurat = FALSE
+)$RNA  # genes x samples
+
+# Normalize
+dge <- DGEList(counts = pb_counts)
+dge <- calcNormFactors(dge)
+logCPM <- cpm(dge, log = TRUE, prior.count = 1)
+
+colnames(logCPM)
+# should be something like: "P1_1_MI", "P1_1_Sham", ..., "P8_3_Sham"
+
+# Helper to get column names for a given age and day
+get_cols <- function(age, day) {
+  list(
+    MI   = paste0(age, "-", day, "-MI"),
+    Sham = paste0(age, "-", day, "-Sham")
+  )
+}
+
+# Δ(A, d) = log2( A_d_MI ) - log2( A_d_Sham )
+compute_delta <- function(age, day) {
+  cols <- get_cols(age, day)
+  MI   <- logCPM[, cols$MI]
+  Sham <- logCPM[, cols$Sham]
+  MI - Sham
+}
+
+# ΔΔ_d = Δ(P1, d) - Δ(P8, d)
+compute_deltaDelta <- function(day) {
+  delta_P1 <- compute_delta("P1", day)
+  delta_P8 <- compute_delta("P8", day)
+  delta_P1 - delta_P8
+}
+ha_genes <- c("Hapln1",
+              "Hapln2",
+              "Hapln3",
+              "Hapln4",
+              "Cd44", 
+              "Has1",
+              "Has2",
+              "Has3",
+              "Vcan",
+              "Acan",
+              "Bcan",
+              "Ncan",
+              "Tnfaip6",
+              "Hmmr")
+days     <- c("1", "3")   # Day 1 and Day 3
+# ha_genes[ha_genes %in% rownames(logCPM)]
+# ha_genes[!ha_genes %in% rownames(logCPM)] 
+
+ha_results_MI <- do.call(rbind, lapply(days, function(d) {
+  delta_P1 <- compute_delta("P1", d)      # MI vs Sham in P1 at day d
+  delta_P8 <- compute_delta("P8", d)      # MI vs Sham in P8 at day d
+  delta_DD <- compute_deltaDelta(d)       # (ΔP1_d – ΔP8_d)
+
+  data.frame(
+    gene      = ha_genes,
+    day       = d,
+    delta_P1  = delta_P1[ha_genes],   # MI effect in P1
+    delta_P8  = delta_P8[ha_genes],   # MI effect in P8
+    delta_DD  = delta_DD[ha_genes],   # difference-of-differences
+    row.names = NULL
+  )
+}))
+
+ha_results_MI
+```
+
+## Heatmap of HA-related genes
+```{r}
+ha_results_MI$day <- factor(ha_results_MI$day, levels = c("1","3"))
+
+# Heatmap of ΔΔ (MI effect P1 minus MI effect P8)
+LIM <- 1.5
+p1 = ggplot(ha_results_MI, aes(x = day, y = gene, fill = delta_DD)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(
+    low       = "#FDE725",
+    mid       = "white",
+    high      = "#191970",
+    midpoint  = 0,
+    limits    = c(-LIM, LIM),
+    oob       = scales::squish,
+    name      = expression(Delta[MI](P1) - Delta[MI](P8))
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid  = element_blank()
+  ) +
+  xlab("Days post MI/Sham") +
+  ylab("HA-axis gene") +
+  ggtitle("HA-axis ΔΔ (MI vs Sham in P1 minus P8)")
+ggsave("HA-heatmap.pdf", plot = p1, width = 24, height = 48)
+
+
+```
+
+## Heatmap of Fibrosis-related genes
+```{r}
+fibrosis_genes <- c("Col1a1",
+                    "Col1a2",
+                    "Col3a1",
+                    "Col5a1",
+                    "Col5a2",
+                    "Col6a1",
+                    "Col6a2",
+                    "Fn1",
+                    "Tnc",
+                    "Tnxb",
+                    "Lox",
+                    "Loxl1",
+                    "Loxl2",
+                    "Loxl4",
+                    "Thbs1",
+                    "Thbs2",
+                    "Thbs3",
+                    "Thbs4",
+                    "Ctgf")
+
+fibrosis_results_MI <- do.call(rbind, lapply(days, function(d) {
+  delta_P1 <- compute_delta("P1", d)      # MI vs Sham in P1 at day d
+  delta_P8 <- compute_delta("P8", d)      # MI vs Sham in P8 at day d
+
+  delta_DD <- delta_P8 - delta_P1        # <-- now relative to P8
+
+  data.frame(
+    gene      = fibrosis_genes,
+    day       = d,
+    delta_P1  = delta_P1[fibrosis_genes],
+    delta_P8  = delta_P8[fibrosis_genes],
+    delta_DD  = delta_DD[fibrosis_genes],
+    row.names = NULL
+  )
+}))
+
+fibrosis_results_MI$gene <- factor(
+  fibrosis_results_MI$gene,
+  levels = fibrosis_genes
+)
+
+fibrosis_results_MI$day <- factor(fibrosis_results_MI$day, levels = c("1","3"))
+
+p1 = ggplot(fibrosis_results_MI, aes(x = day, y = gene, fill = delta_DD)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(
+    low       = "#FDE725",
+    mid       = "white",
+    high      = "#191970",
+    midpoint  = 0,
+    limits    = c(-LIM, LIM),
+    oob       = scales::squish,
+    name      = expression(Delta[MI](P8) - Delta[MI](P1))
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid  = element_blank()
+  ) +
+  xlab("Days post MI/Sham") +
+  ylab("Fibrosis-axis gene") +
+  ggtitle("Fibrosis-axis ΔΔ (MI vs Sham in P8 minus P1)")
+ggsave("fibrosis-heatmap.pdf", plot = p1, width = 24, height = 48)
+```
